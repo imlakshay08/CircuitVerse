@@ -1,15 +1,17 @@
 # frozen_string_literal: true
 
 require "pg_search"
+
 class Project < ApplicationRecord
   extend FriendlyId
+
   friendly_id :name, use: %i[slugged history]
-  self.ignored_columns += ["data"]
+  self.ignored_columns += %w[data searchable]
 
   validates :name, length: { minimum: 1 }
   validates :slug, uniqueness: true
 
-  belongs_to :author, class_name: "User"
+  belongs_to :author, class_name: "User", counter_cache: true
   has_many :forks, class_name: "Project", foreign_key: "forked_project_id", dependent: :nullify
   belongs_to :forked_project, class_name: "Project", optional: true
   has_many :stars, dependent: :destroy
@@ -28,6 +30,8 @@ class Project < ApplicationRecord
   has_one :grade, dependent: :destroy
   has_one :project_datum, dependent: :destroy
   has_many :notifications, as: :notifiable
+  has_one :contest_winner, dependent: :destroy
+  has_many :submissions, dependent: :destroy
 
   scope :public_and_not_forked,
         -> { where(project_access_type: "Public", forked_project_id: nil) }
@@ -37,6 +41,7 @@ class Project < ApplicationRecord
   scope :by, ->(author_id) { where(author_id: author_id) }
 
   include PgSearch::Model
+
   accepts_nested_attributes_for :project_datum
   pg_search_scope :text_search, against: %i[name description], using: {
     tsearch: {
@@ -44,31 +49,11 @@ class Project < ApplicationRecord
     }
   }
 
-  trigger.before(:insert, :update) do
-    "tsvector_update_trigger(
-        searchable, 'pg_catalog.english', description, name
-      );"
-  end
-
-  searchable do
-    text :name
-
-    text :description
-
-    text :author do
-      author.name
-    end
-
-    text :tags do
-      tags.map(&:name)
-    end
-  end
-
   after_update :check_and_remove_featured
 
   before_destroy :purge_circuit_preview
 
-  self.per_page = 6
+  self.per_page = 9
 
   acts_as_commontable
   # after_commit :send_mail, on: :create
@@ -141,6 +126,16 @@ class Project < ApplicationRecord
   validate :check_validity
   validate :clean_description
 
+  def sim_version
+    raw_data = project_datum&.data
+    parsed_data = raw_data.present? ? JSON.parse(raw_data) : {}
+    parsed_data["simulatorVersion"] || "legacy"
+  end
+
+  def uses_vue_simulator?
+    %w[v0 v1].include?(sim_version)
+  end
+
   private
 
     def check_validity
@@ -167,7 +162,7 @@ class Project < ApplicationRecord
 
     def should_generate_new_friendly_id?
       # FIXME: Remove extra query once production data is resolved
-      name_changed? || Project.where(slug: slug).count > 1
+      name_changed? || Project.where(slug: slug).many?
     end
 
     def purge_circuit_preview
